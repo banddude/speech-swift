@@ -416,4 +416,328 @@ final class DiarizationHelpersTests: XCTestCase {
         XCTAssertFalse((SortformerDiarizer.self as Any) is SpeakerExtractionCapable.Type)
     }
     #endif
+
+
+    // MARK: - scalability + legacy equivalence (#2930)
+
+    /// A verbatim copy of the pre-#2930 clustering (memoized n*n matrix plus a
+    /// full active-pair scan per merge). The public entry points now cap the
+    /// item count and stride-sample oversize inputs (see the DiarizationClustering
+    /// file header), and the exact algorithm is what actually runs at or under
+    /// the cap — so every case below uses sizes under ``maxClusterItems`` and
+    /// must produce the identical partition, not a tolerance.
+    private enum LegacyAgglomerative {
+
+    /// Constrained agglomerative clustering with centroid linkage and cosine distance.
+    ///
+    /// Items from the same window can never be merged (same-window constraint).
+    /// Merges closest unconstrained pair until distance exceeds threshold.
+    ///
+    /// - Parameters:
+    ///   - items: per-window per-speaker embeddings
+    ///   - threshold: cosine distance threshold (0–2). Pairs with distance >= threshold are not merged.
+    /// - Returns: cluster assignment for each item, and cluster centroids
+    static func constrainedAgglomerativeClustering(
+        items: [DiarizationHelpers.ClusterItem],
+        threshold: Float
+    ) -> (clusterAssignment: [Int], centroids: [[Float]]) {
+        guard !items.isEmpty else { return ([], []) }
+        if items.count == 1 {
+            return ([0], [items[0].embedding])
+        }
+
+        let n = items.count
+        let dim = items[0].embedding.count
+
+        // Each item starts as its own cluster
+        var clusterOf = Array(0..<n)  // item → cluster ID
+        var centroids = items.map { $0.embedding }  // cluster ID → centroid
+        var clusterMembers = (0..<n).map { [$0] }  // cluster ID → member items
+        // Window indices per cluster (for constraint checking)
+        var clusterWindows = items.map { Set([$0.windowIndex]) }
+        var active = Set(0..<n)
+
+        // Memoized pairwise distances (flat n*n, symmetric). Constrained pairs
+        // are stored as +inf. A pair's distance (and its constraint state) only
+        // changes when one side merges, and the merged cluster's row/column is
+        // recomputed below — so the cache is always exact and the merge order
+        // is identical to the original recompute-every-iteration loop, at
+        // O(n^2) total distance work instead of O(n^3).
+        var dist = [Float](repeating: .infinity, count: n * n)
+        for i in 0..<n {
+            for j in (i + 1)..<n where items[i].windowIndex != items[j].windowIndex {
+                let d = cosineDistance(centroids[i], centroids[j])
+                dist[i * n + j] = d
+                dist[j * n + i] = d
+            }
+        }
+
+        while active.count > 1 {
+            // Find closest unconstrained pair
+            var bestDist: Float = Float.greatestFiniteMagnitude
+            var bestI = -1, bestJ = -1
+
+            let activeList = active.sorted()
+            for ai in 0..<activeList.count {
+                for aj in (ai + 1)..<activeList.count {
+                    let ci = activeList[ai], cj = activeList[aj]
+                    let d = dist[ci * n + cj]
+                    if d < bestDist {
+                        bestDist = d
+                        bestI = ci
+                        bestJ = cj
+                    }
+                }
+            }
+
+            guard bestDist < threshold && bestI >= 0 else { break }
+
+            // Merge bestJ into bestI
+            let sizeI = clusterMembers[bestI].count
+            let sizeJ = clusterMembers[bestJ].count
+            let totalSize = Float(sizeI + sizeJ)
+
+            // Weighted average centroid
+            var newCentroid = [Float](repeating: 0, count: dim)
+            for d in 0..<dim {
+                newCentroid[d] = (centroids[bestI][d] * Float(sizeI) + centroids[bestJ][d] * Float(sizeJ)) / totalSize
+            }
+            centroids[bestI] = newCentroid
+
+            // Transfer members
+            for member in clusterMembers[bestJ] {
+                clusterOf[member] = bestI
+            }
+            clusterMembers[bestI].append(contentsOf: clusterMembers[bestJ])
+
+            // Propagate window constraints
+            clusterWindows[bestI].formUnion(clusterWindows[bestJ])
+
+            active.remove(bestJ)
+
+            // Refresh the merged cluster's cached distances (its centroid and
+            // window set both changed); everything else is untouched.
+            for other in active where other != bestI {
+                let d: Float = clusterWindows[bestI].isDisjoint(with: clusterWindows[other])
+                    ? cosineDistance(centroids[bestI], centroids[other])
+                    : .infinity
+                dist[bestI * n + other] = d
+                dist[other * n + bestI] = d
+            }
+        }
+
+        // Build final compact assignment
+        let activeSorted = active.sorted()
+        var clusterMap = [Int: Int]()  // old cluster ID → new compact ID
+        for (newId, oldId) in activeSorted.enumerated() {
+            clusterMap[oldId] = newId
+        }
+
+        let assignment = (0..<n).map { clusterMap[clusterOf[$0]]! }
+        let finalCentroids = activeSorted.map { centroids[$0] }
+
+        return (assignment, finalCentroids)
+    }
+
+    /// Agglomerative clustering with centroid linkage and cosine distance.
+    ///
+    /// Unlike ``constrainedAgglomerativeClustering(items:threshold:)``, this
+    /// first estimates global speaker clusters without applying a transitive
+    /// same-window cannot-link constraint. This mirrors the reference
+    /// pyannote pipeline, which clusters globally and only constrains the later
+    /// per-window assignment step. A false local track can therefore merge
+    /// back into its real speaker instead of forcing a new global identity.
+    static func agglomerativeClustering(
+        items: [DiarizationHelpers.ClusterItem],
+        threshold: Float
+    ) -> (clusterAssignment: [Int], centroids: [[Float]]) {
+        guard !items.isEmpty else { return ([], []) }
+        if items.count == 1 {
+            return ([0], [items[0].embedding])
+        }
+
+        let n = items.count
+        let dim = items[0].embedding.count
+        var clusterOf = Array(0..<n)
+        var centroids = items.map(\.embedding)
+        var clusterMembers = (0..<n).map { [$0] }
+        var active = Set(0..<n)
+
+        var dist = [Float](repeating: .infinity, count: n * n)
+        for i in 0..<n {
+            for j in (i + 1)..<n {
+                let d = cosineDistance(centroids[i], centroids[j])
+                dist[i * n + j] = d
+                dist[j * n + i] = d
+            }
+        }
+
+        while active.count > 1 {
+            var bestDist = Float.greatestFiniteMagnitude
+            var bestI = -1
+            var bestJ = -1
+
+            let activeList = active.sorted()
+            for ai in 0..<activeList.count {
+                for aj in (ai + 1)..<activeList.count {
+                    let ci = activeList[ai]
+                    let cj = activeList[aj]
+                    let d = dist[ci * n + cj]
+                    if d < bestDist {
+                        bestDist = d
+                        bestI = ci
+                        bestJ = cj
+                    }
+                }
+            }
+
+            guard bestDist < threshold && bestI >= 0 else { break }
+
+            let sizeI = clusterMembers[bestI].count
+            let sizeJ = clusterMembers[bestJ].count
+            let totalSize = Float(sizeI + sizeJ)
+            var newCentroid = [Float](repeating: 0, count: dim)
+            for d in 0..<dim {
+                newCentroid[d] = (
+                    centroids[bestI][d] * Float(sizeI)
+                        + centroids[bestJ][d] * Float(sizeJ)
+                ) / totalSize
+            }
+            centroids[bestI] = newCentroid
+
+            for member in clusterMembers[bestJ] {
+                clusterOf[member] = bestI
+            }
+            clusterMembers[bestI].append(contentsOf: clusterMembers[bestJ])
+            active.remove(bestJ)
+
+            for other in active where other != bestI {
+                let d = cosineDistance(centroids[bestI], centroids[other])
+                dist[bestI * n + other] = d
+                dist[other * n + bestI] = d
+            }
+        }
+
+        let activeSorted = active.sorted()
+        let clusterMap = Dictionary(
+            uniqueKeysWithValues: activeSorted.enumerated().map { ($1, $0) })
+        let assignment = (0..<n).map { clusterMap[clusterOf[$0]]! }
+        let finalCentroids = activeSorted.map { centroids[$0] }
+        return (assignment, finalCentroids)
+    }
+
+    /// Cosine distance between two vectors: 1 - cosine_similarity.
+    /// Returns value in [0, 2].
+    static func cosineDistance(_ a: [Float], _ b: [Float]) -> Float {
+        let n = min(a.count, b.count)
+        guard n > 0 else { return 2.0 }
+
+        var dot: Float = 0, normA: Float = 0, normB: Float = 0
+        for i in 0..<n {
+            dot += a[i] * b[i]
+            normA += a[i] * a[i]
+            normB += b[i] * b[i]
+        }
+
+        let denom = sqrt(normA) * sqrt(normB)
+        guard denom > 1e-10 else { return 2.0 }
+        return 1.0 - dot / denom
+    }
+    }
+
+    private struct SeededRandom {
+        var state: UInt64
+        init(seed: UInt64) { state = seed &+ 0x9E3779B97F4A7C15 }
+        mutating func next() -> UInt64 {
+            state = state &+ 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+        mutating func unit() -> Float {
+            Float(next() >> 40) / Float(1 << 24)
+        }
+    }
+
+    /// Deterministic clustered embeddings: `speakers` unit-ish vectors around
+    /// distinct directions plus per-item noise.
+    private func syntheticItems(
+        count: Int, speakers: Int, dimension: Int, windows: Int, seed: UInt64
+    ) -> [DiarizationHelpers.ClusterItem] {
+        var rng = SeededRandom(seed: seed)
+        var centers = [[Float]]()
+        for s in 0..<speakers {
+            var v = (0..<dimension).map { _ in rng.unit() - 0.5 }
+            let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+            v = v.map { $0 / norm }
+            centers.append(v)
+        }
+        return (0..<count).map { i in
+            let speaker = i % speakers
+            let embedding = centers[speaker].map { value in
+                value + (rng.unit() - 0.5) * 0.04
+            }
+            return DiarizationHelpers.ClusterItem(
+                windowIndex: i % windows, localSpeakerId: speaker, embedding: embedding)
+        }
+    }
+
+    private func assertSamePartition(
+        _ a: [Int], _ b: [Int], file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(a.count, b.count, "assignment lengths differ", file: file, line: line)
+        var mapping = [Int: Int]()
+        for (x, y) in zip(a, b) {
+            if let expected = mapping[x] {
+                XCTAssertEqual(expected, y, "partitions differ at some item", file: file, line: line)
+            } else {
+                mapping[x] = y
+            }
+        }
+    }
+
+    func testClusteringMatchesLegacyOnRandomInputs() {
+        let cases: [(count: Int, speakers: Int, dimension: Int, windows: Int, threshold: Float)] = [
+            (50, 3, 32, 12, 0.715),
+            (200, 2, 64, 40, 0.5),
+            (200, 4, 16, 40, 1.2),
+            (150, 2, 8, 75, 0.715),
+        ]
+        for testCase in cases {
+            let items = syntheticItems(
+                count: testCase.count, speakers: testCase.speakers,
+                dimension: testCase.dimension, windows: testCase.windows, seed: 42)
+            let (assignment, centroids) = DiarizationHelpers.agglomerativeClustering(
+                items: items, threshold: testCase.threshold)
+            let (legacyAssignment, legacyCentroids) = LegacyAgglomerative.agglomerativeClustering(
+                items: items, threshold: testCase.threshold)
+            assertSamePartition(assignment, legacyAssignment)
+            XCTAssertEqual(centroids.count, legacyCentroids.count)
+
+            let constrained = DiarizationHelpers.constrainedAgglomerativeClustering(
+                items: items, threshold: testCase.threshold)
+            let legacyConstrained = LegacyAgglomerative.constrainedAgglomerativeClustering(
+                items: items, threshold: testCase.threshold)
+            assertSamePartition(constrained.clusterAssignment, legacyConstrained.clusterAssignment)
+            XCTAssertEqual(constrained.centroids.count, legacyConstrained.centroids.count)
+        }
+    }
+
+    func testClusteringStaysFastAndBoundedAtScale() {
+        // 4,000 embeddings exceeds maxClusterItems, so this runs the capped
+        // path (stride sample of 3,000 clustered exactly, remainder assigned
+        // to their nearest centroid): bounded memory, seconds of runtime, and
+        // still three clean speakers. The pre-#2930 implementation needed a
+        // 64 MB matrix and ~10^10 pair visits here.
+        let items = syntheticItems(count: 4000, speakers: 3, dimension: 256, windows: 1300, seed: 7)
+        let start = Date()
+        let (assignment, centroids) = DiarizationHelpers.agglomerativeClustering(
+            items: items, threshold: 0.715)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(assignment.count, items.count)
+        XCTAssertEqual(Set(assignment).count, 3)
+        XCTAssertEqual(centroids.count, 3)
+        XCTAssertLessThan(elapsed, 60.0, "clustering regressed to a super-quadratic scan")
+    }
 }

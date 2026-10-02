@@ -123,9 +123,17 @@ class WeSpeakerNetwork: Module {
     }
 
     /// Forward pass.
-    /// - Parameter mel: `[B, T, 80, 1]` mel spectrogram (channels-last)
+    /// - Parameters:
+    ///   - mel: `[B, T, 80, 1]` mel spectrogram (channels-last)
+    ///   - validFrames: per-row count of valid mel frames when the batch was
+    ///     padded to a common length (``WeSpeakerModel.embedBatched``). Rows
+    ///     pool only their valid frames, which reproduces the batch-of-1
+    ///     embeddings exactly at those frames: the convolutions see the same
+    ///     inputs (an explicit zero tail matches MLX's own beyond-edge zero
+    ///     padding), and only the statistics pooling would otherwise mix the
+    ///     padding in. Nil when every row is a full-length input.
     /// - Returns: `[B, 256]` L2-normalized speaker embedding
-    func callAsFunction(_ mel: MLXArray) -> MLXArray {
+    func callAsFunction(_ mel: MLXArray, validFrames: [Int]? = nil) -> MLXArray {
         // mel: [B, T, 80, 1]
         // Python WeSpeaker permutes input: (B,T,F) -> (B,F,T) -> (B,1,F,T)
         // In MLX NHWC: (B,1,F,T) maps to [B, F, T, 1]
@@ -150,10 +158,28 @@ class WeSpeakerNetwork: Module {
         x = x.reshaped(B, Tp, -1)  // [B, T/8, 2560] in C*F order
 
         // Statistics pooling: mean + std over time (dim=1) → [B, 5120]
-        let mean = x.mean(axis: 1)  // [B, 2560]
-        let variance = x.variance(axis: 1)  // [B, 2560]
-        let std = sqrt(variance + 1e-10)
-        let pooled = concatenated([mean, std], axis: -1)  // [B, 5120]
+        let pooled: MLXArray
+        if let validFrames {
+            // Masked pooling over each row's valid frames. A stride-2, kernel
+            // 3, pad 1 conv maps t valid frames to ceil(t/2), so positions
+            // below that bound only read valid inputs at every level.
+            func downsampledLength(_ t: Int) -> Int { (t + 1) / 2 }
+            let valid = validFrames.map { min(max(1, downsampledLength($0)), Tp) }
+            let positions = MLXArray(0..<Tp).reshaped(1, Tp)
+            let limits = MLXArray(valid).reshaped(B, 1)
+            let mask = (positions .< limits).asType(.float32).expandedDimensions(axis: 2)  // [B, T', 1]
+            let counts = mask.sum(axis: 1)  // [B, 1]
+            let mean = (x * mask).sum(axis: 1) / counts  // [B, 2560]
+            let centered = x - mean.expandedDimensions(axis: 1)  // [B, T', 2560]
+            let variance = ((centered * centered) * mask).sum(axis: 1) / counts
+            let std = sqrt(variance + 1e-10)
+            pooled = concatenated([mean, std], axis: -1)  // [B, 5120]
+        } else {
+            let mean = x.mean(axis: 1)  // [B, 2560]
+            let variance = x.variance(axis: 1)  // [B, 2560]
+            let std = sqrt(variance + 1e-10)
+            pooled = concatenated([mean, std], axis: -1)  // [B, 5120]
+        }
 
         // Embedding projection
         var emb = embedding(pooled)  // [B, 256]

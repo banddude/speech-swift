@@ -315,13 +315,20 @@ public final class PyannoteDiarizationPipeline {
         let framesPerChunk = 589
         let frameDuration = windowDuration / Float(framesPerChunk)
         // Match the segmentation model's reference inference recipe: a 10%
-        // step gives 90% overlap between consecutive 10-second windows.
-        let stepSamples = windowSamples / 10
-
+        // step gives 90% overlap between consecutive 10-second windows. That
+        // overlap is context, not resolution — every window still produces the
+        // same 589-frame probability tracks, and the center zones below still
+        // tile the whole timeline. A 1 s step made the window count (and with
+        // it the embedding and clustering cost) 10x the recording length, so
+        // long recordings step coarser (#2930): 2.5 s past 15 minutes, 5 s
+        // past an hour. Short recordings keep the reference step.
         let numSamples = samples.count
         guard numSamples > 0 else {
             return DiarizationResult(segments: [], numSpeakers: 0, speakerEmbeddings: [])
         }
+        let audioMinutes = Float(numSamples) / Float(sampleRate) / 60
+        let stepDivisor = audioMinutes >= 60 ? 2 : (audioMinutes >= 15 ? 4 : 10)
+        let stepSamples = windowSamples / stepDivisor
 
         // Generate window positions with 50% overlap
         var positions = [(start: Int, end: Int)]()
@@ -368,18 +375,22 @@ public final class PyannoteDiarizationPipeline {
                 }
             }
 
-            let input = MLXArray(flat).reshaped(batchEnd - batchStart, 1, windowSamples)
-            let posteriors = segmentationModel(input)
-            let speakerProbs = PowersetDecoder.hardSpeakerActivity(from: posteriors)
-            eval(speakerProbs)
+            // The forward pass and the track copies below allocate a lot of
+            // short-lived memory; drain their temporaries before the next
+            // batch instead of piling hundreds of windows' worth up (#2928).
+            autoreleasepool {
+                let input = MLXArray(flat).reshaped(batchEnd - batchStart, 1, windowSamples)
+                let speakerProbs = PowersetDecoder.hardSpeakerActivity(from: segmentationModel(input))
+                eval(speakerProbs)
 
-            for (bi, p) in (batchStart..<batchEnd).enumerated() {
-                var tracks = [[Float]]()
-                for spk in 0..<3 {
-                    tracks.append(speakerProbs[bi, 0..., spk].asArray(Float.self))
+                for (bi, p) in (batchStart..<batchEnd).enumerated() {
+                    var tracks = [[Float]]()
+                    for spk in 0..<3 {
+                        tracks.append(speakerProbs[bi, 0..., spk].asArray(Float.self))
+                    }
+                    windowProbs.append(WindowProbs(startSample: positions[p].start,
+                                                   endSample: positions[p].end, tracks: tracks))
                 }
-                windowProbs.append(WindowProbs(startSample: positions[p].start,
-                                               endSample: positions[p].end, tracks: tracks))
             }
             completedUnits += batchEnd - batchStart
             batchStart = batchEnd
@@ -389,9 +400,31 @@ public final class PyannoteDiarizationPipeline {
             return DiarizationResult(segments: [], numSpeakers: 0, speakerEmbeddings: [])
         }
 
-        // Step 2: Extract per-window per-speaker embeddings from non-overlapping speech
+        // Step 2: Extract per-window per-speaker embeddings from non-overlapping speech.
+        // The crops queue up and run through the embedding model in batches of
+        // 32 (#2930: this stage used to run one forward pass per crop, which
+        // is roughly an order of magnitude more forward passes than the batch
+        // needs, each dominated by dispatch overhead). Audio is never held for
+        // the whole stage: a crop joins the queue, and a flush both embeds it
+        // and drops it.
         let minEmbeddingSamples = sampleRate / 2  // 0.5s minimum for embedding
+        let embeddingBatch = 32
         var windowEmbeddings = [WindowSpeakerEmbedding]()
+        var pendingCrops = [(windowIndex: Int, localSpeakerId: Int, audio: [Float])]()
+
+        func flushEmbeddingBatch() {
+            guard !pendingCrops.isEmpty else { return }
+            let crops = pendingCrops
+            pendingCrops = []
+            let embeddings = embeddingModel.embedBatched(
+                crops.map(\.audio), sampleRate: sampleRate)
+            for (crop, embedding) in zip(crops, embeddings) {
+                windowEmbeddings.append(WindowSpeakerEmbedding(
+                    windowIndex: crop.windowIndex,
+                    localSpeakerId: crop.localSpeakerId,
+                    embedding: embedding))
+            }
+        }
 
         for (wIdx, wp) in windowProbs.enumerated() {
             completedUnits += 1
@@ -444,11 +477,13 @@ public final class PyannoteDiarizationPipeline {
                 // Need minimum 0.5s of audio for a reliable embedding
                 guard spkAudio.count >= minEmbeddingSamples else { continue }
 
-                let embedding = embeddingModel.embed(audio: spkAudio, sampleRate: sampleRate)
-                windowEmbeddings.append(WindowSpeakerEmbedding(
-                    windowIndex: wIdx, localSpeakerId: localSpk, embedding: embedding))
+                pendingCrops.append((windowIndex: wIdx, localSpeakerId: localSpk, audio: spkAudio))
+                if pendingCrops.count >= embeddingBatch {
+                    autoreleasepool { flushEmbeddingBatch() }
+                }
             }
         }
+        autoreleasepool { flushEmbeddingBatch() }
 
         // Handle edge case: no embeddings could be extracted
         guard !windowEmbeddings.isEmpty else {
@@ -462,6 +497,15 @@ public final class PyannoteDiarizationPipeline {
                 localSpeakerId: $0.localSpeakerId,
                 embedding: $0.embedding)
         }
+
+        // Report the clustering stage's peak memory (#2930): the capped
+        // algorithm bounds its distance matrix to the cap, so the bound is a
+        // constant no matter how long the recording is.
+        let clusterMatrixMB = Double(min(clusterItems.count, DiarizationHelpers.maxClusterItems))
+            * Double(min(clusterItems.count, DiarizationHelpers.maxClusterItems)) * 4 / 1_048_576
+        progressHandler?(0.99, String(
+            format: "Clustering %d items (distance matrix bound %.0f MB, cap %d)",
+            clusterItems.count, clusterMatrixMB, DiarizationHelpers.maxClusterItems))
 
         let (clusterAssignment, centroids) = DiarizationHelpers.agglomerativeClustering(
             items: clusterItems, threshold: config.clusteringThreshold)

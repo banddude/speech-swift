@@ -213,6 +213,92 @@ public final class WeSpeakerModel {
         return emb[0].asArray(Float.self)
     }
 
+    /// Extract 256-dimensional speaker embeddings for a batch of clips in one
+    /// forward pass per group (#2930: diarization used to run one forward pass
+    /// per (window, speaker) crop, which is what made long recordings take
+    /// hours — the model spends most of a small forward pass on dispatch
+    /// overhead, not math).
+    ///
+    /// Clips are grouped by similar length so the zero padding added to make
+    /// the batch rectangular stays small, and each row's statistics pooling is
+    /// masked to its valid frames (see ``WeSpeakerNetwork.callAsFunction``),
+    /// which reproduces ``embed(audio:sampleRate:)`` for every clip.
+    ///
+    /// - Parameters:
+    ///   - audios: PCM Float32 clips
+    ///   - sampleRate: sample rate of the input clips
+    /// - Returns: one 256-dim L2-normalized embedding per input clip, in input order
+    public func embedBatched(_ audios: [[Float]], sampleRate: Int) -> [[Float]] {
+        guard !audios.isEmpty else { return [] }
+        guard let network else { fatalError("MLX network not loaded") }
+
+        struct Clip {
+            let mel: MLXArray
+            let frames: Int
+        }
+
+        // Extract mel per clip, then order by length: a batch of similar
+        // lengths pads far less than the input order would.
+        var clips: [Clip] = audios.map { audio in
+            let samples = sampleRate == inputSampleRate
+                ? audio
+                : AudioFileLoader.resample(audio, from: sampleRate, to: inputSampleRate)
+            let mel = melExtractor.extract(samples)
+            return Clip(mel: mel, frames: mel.dim(0))
+        }
+        let byLength = clips.indices.sorted { clips[$0].frames > clips[$1].frames }
+
+        var embeddings = [[Float]](repeating: [], count: audios.count)
+        let groupSize = 32
+        // Cap the FORWARD PASS by total mel frames, not just crop count: the
+        // ResNet's activations scale with batch x frames, so 32 ten-second
+        // crops would hold several GB of intermediate buffers at once (and
+        // blew MLX's peak past 5 GB on a 36-minute file). ~8,000 frames is
+        // 80 seconds of audio, the work of eight batch-of-1 passes, with a
+        // peak that stays flat as recordings get longer.
+        let maxFramesPerGroup = 8_000
+
+        var position = 0
+        while position < byLength.count {
+            var end = position
+            var frames = 0
+            while end < byLength.count,
+                  end - position < groupSize,
+                  frames + clips[byLength[end]].frames <= maxFramesPerGroup {
+                frames += clips[byLength[end]].frames
+                end += 1
+            }
+            if end == position {
+                // A single clip longer than the budget still runs alone.
+                end = position + 1
+            }
+            let group = byLength[position..<end]
+            position = end
+
+            let maxFrames = group.map { clips[$0].frames }.max() ?? 0
+            var flat = [Float](repeating: 0, count: group.count * maxFrames * 80)
+            for (row, index) in group.enumerated() {
+                let mel = clips[index].mel
+                let frames = clips[index].frames
+                let values = mel.asArray(Float.self)
+                flat.replaceSubrange(
+                    row * maxFrames * 80..<row * maxFrames * 80 + frames * 80,
+                    with: values)
+            }
+            var validFrames = [Int]()
+            for index in group { validFrames.append(clips[index].frames) }
+
+            let input = MLXArray(flat, [group.count, maxFrames, 80, 1])
+            let emb = network(input, validFrames: validFrames)
+            eval(emb)
+            for (row, index) in group.enumerated() {
+                embeddings[index] = emb[row].asArray(Float.self)
+            }
+        }
+
+        return embeddings
+    }
+
     /// Compute cosine similarity between two embeddings.
     public static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
